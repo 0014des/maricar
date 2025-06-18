@@ -1,0 +1,502 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8" />
+  <title>マリオカート風ゲーム 完全版</title>
+  <style>
+    * { margin:0; padding:0; box-sizing: border-box; }
+    canvas {
+      display: block;
+      margin: auto;
+      background-color: black;
+      border: 3px solid #555;
+    }
+    #ui {
+      position: absolute;
+      top: 10px;
+      left: 10px;
+      color: white;
+      font: 16px sans-serif;
+      user-select: none;
+      z-index: 10;
+    }
+    #touch-controls {
+      position: absolute;
+      bottom: 10px;
+      left: 50%;
+      transform: translateX(-50%);
+      display: flex;
+      gap: 10px;
+      z-index: 10;
+    }
+    .touch-btn {
+      width: 60px;
+      height: 60px;
+      background: rgba(255, 255, 255, 0.3);
+      border-radius: 50%;
+      text-align: center;
+      line-height: 60px;
+      font-size: 24px;
+      user-select: none;
+      -webkit-tap-highlight-color: transparent;
+    }
+  </style>
+</head>
+<body>
+  <canvas id="game" width="800" height="600"></canvas>
+  <div id="ui"></div>
+  <div id="touch-controls">
+    <div class="touch-btn" id="left">◀️</div>
+    <div class="touch-btn" id="up">🔼</div>
+    <div class="touch-btn" id="right">▶️</div>
+    <div class="touch-btn" id="item">🎯</div>
+  </div>
+
+<script>
+  const canvas = document.getElementById("game");
+  const ctx = canvas.getContext("2d");
+  const W = canvas.width, H = canvas.height;
+  const ui = document.getElementById("ui");
+
+  // 画像素材（トラック・マスク）
+  const track = new Image(); track.src = "track.png";
+  const trackMask = new Image(); trackMask.src = "track_mask.png";
+
+  // 音声素材
+  const sounds = {
+    accel: new Audio("accel.mp3"),
+    hit: new Audio("hit.mp3"),
+    goal: new Audio("goal.mp3"),
+    item: new Audio("item.mp3"),
+    start: new Audio("start.mp3"),
+    bgm: new Audio("bgm.mp3")
+  };
+  sounds.bgm.loop = true;
+  sounds.bgm.volume = 0.3;
+
+  // --- キー＆タッチ入力管理 ---
+  const keys = {};
+  ["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", " "].forEach(k => {
+    document.addEventListener("keydown", e => {
+      if (e.key === k) keys[k] = true;
+    });
+    document.addEventListener("keyup", e => {
+      if (e.key === k) keys[k] = false;
+    });
+  });
+
+  const btnMap = {
+    up: "ArrowUp",
+    left: "ArrowLeft",
+    right: "ArrowRight",
+    item: " "
+  };
+  Object.keys(btnMap).forEach(id => {
+    const btn = document.getElementById(id);
+    btn.addEventListener("touchstart", e => {
+      e.preventDefault();
+      keys[btnMap[id]] = true;
+    });
+    btn.addEventListener("touchend", e => {
+      e.preventDefault();
+      keys[btnMap[id]] = false;
+    });
+  });
+
+  // --- 衝突マスク ---
+  const maskCanvas = document.createElement("canvas");
+  const maskCtx = maskCanvas.getContext("2d");
+  maskCanvas.width = W;
+  maskCanvas.height = H;
+
+  function prepareMask() {
+    maskCtx.drawImage(trackMask, 0, 0);
+  }
+  function getMaskPixel(x, y) {
+    const px = Math.floor(x), py = Math.floor(y);
+    if (px < 0 || py < 0 || px >= W || py >= H) return [0,0,0];
+    const data = maskCtx.getImageData(px, py, 1, 1).data;
+    return [data[0], data[1], data[2]];
+  }
+
+  // --- Carクラス ---
+  class Car {
+    constructor(name, x, y, color, isCPU = false) {
+      this.name = name;
+      this.x = x;
+      this.y = y;
+      this.vx = 0;
+      this.vy = 0;
+      this.angle = 0;
+      this.speed = 0;
+      this.maxSpeed = 4;
+      this.accel = 0.15;
+      this.friction = 0.04;
+      this.size = 24;
+      this.color = color;
+      this.lap = 0;
+      this.time = 0;
+      this.done = false;
+      this.checkpoints = [false, false];
+      this.item = null;
+      this.isCPU = isCPU;
+      this.targetIndex = 0;
+      this.shellCooldown = 0;
+    }
+
+    update(dt, input) {
+      if (this.done) return;
+      this.time += dt;
+
+      // CPU制御
+      if (this.isCPU) {
+        const target = cpuPath[this.targetIndex];
+        const dx = target.x - this.x;
+        const dy = target.y - this.y;
+        const angTo = Math.atan2(dy, dx);
+        let deltaA = angTo - this.angle;
+        deltaA = ((deltaA + Math.PI) % (2 * Math.PI)) - Math.PI;
+        this.angle += deltaA * 0.05;
+        input = { up: true };
+        if (Math.hypot(dx, dy) < 40) {
+          this.targetIndex = (this.targetIndex + 1) % cpuPath.length;
+        }
+      }
+
+      // プレイヤー操作
+      if (!this.isCPU && input) {
+        if (input.up) {
+          this.speed += this.accel;
+          sounds.accel.currentTime = 0;
+          sounds.accel.play();
+        } else if (input.down) {
+          this.speed -= this.accel;
+        } else {
+          this.speed *= (1 - this.friction);
+        }
+
+        if (input.left) this.angle -= 0.05;
+        if (input.right) this.angle += 0.05;
+      } else {
+        // CPUも減速摩擦かける
+        this.speed *= (1 - this.friction);
+      }
+
+      // 移動
+      this.speed = Math.max(-this.maxSpeed, Math.min(this.speed, this.maxSpeed));
+      this.vx = Math.cos(this.angle) * this.speed;
+      this.vy = Math.sin(this.angle) * this.speed;
+      this.x += this.vx;
+      this.y += this.vy;
+
+      // 衝突判定（マスク）
+      const maskColor = getMaskPixel(this.x, this.y);
+      if (maskColor[0] < 200) { // 通行不可エリア減速
+        this.speed *= 0.9;
+      }
+
+      // チェックポイント判定
+      if (this.x > 380 && this.x < 420 && this.y > 40 && this.y < 100) {
+        this.checkpoints[0] = true;
+      }
+      if (this.x > 380 && this.x < 420 && this.y > 500 && this.y < 560) {
+        this.checkpoints[1] = true;
+      }
+
+      // ゴール判定
+      if (this.checkpoints[0] && this.checkpoints[1] && this.x > 750 && this.y > 550) {
+        this.lap++;
+        this.checkpoints = [false, false];
+        sounds.goal.currentTime = 0;
+        sounds.goal.play();
+        if (this.lap >= 2) this.done = true;
+      }
+
+      if (this.shellCooldown > 0) this.shellCooldown -= dt;
+    }
+
+    draw() {
+      ctx.save();
+      ctx.translate(this.x, this.y);
+      ctx.rotate(this.angle);
+      ctx.fillStyle = this.color;
+      ctx.fillRect(-this.size / 2, -this.size / 2, this.size, this.size);
+      ctx.restore();
+    }
+
+    useItem() {
+      if (this.item === "shell" && this.shellCooldown <= 0) {
+        shells.push(new Shell(this.x, this.y, this.angle, this));
+        this.item = null;
+        this.shellCooldown = 1;
+      }
+    }
+  }
+
+  // CPU移動パス
+  const cpuPath = [
+    { x: 400, y: 100 },
+    { x: 750, y: 300 },
+    { x: 400, y: 550 },
+    { x: 50, y: 300 }
+  ];
+
+  // バナナクラス
+  class Banana {
+    constructor(x, y) {
+      this.x = x;
+      this.y = y;
+      this.size = 16;
+    }
+    draw() {
+      ctx.fillStyle = "yellow";
+      ctx.beginPath();
+      ctx.arc(this.x, this.y, this.size, 0, 2 * Math.PI);
+      ctx.fill();
+    }
+  }
+
+  // 甲羅クラス
+  class Shell {
+    constructor(x, y, angle, owner) {
+      this.x = x;
+      this.y = y;
+      this.angle = angle;
+      this.owner = owner;
+      this.size = 12;
+      this.speed = 6;
+      this.dead = false;
+    }
+    update() {
+      this.x += Math.cos(this.angle) * this.speed;
+      this.y += Math.sin(this.angle) * this.speed;
+
+      cars.forEach(car => {
+        if (car !== this.owner && !car.done && Math.hypot(this.x - car.x, this.y - car.y) < car.size / 2 + this.size) {
+          car.speed *= 0.5;
+          this.dead = true;
+          sounds.hit.currentTime = 0;
+          sounds.hit.play();
+        }
+      });
+
+      // 画面外で消滅
+      if (this.x < 0 || this.y < 0 || this.x > W || this.y > H) this.dead = true;
+    }
+    draw() {
+      ctx.fillStyle = "cyan";
+      ctx.beginPath();
+      ctx.arc(this.x, this.y, this.size, 0, 2 * Math.PI);
+      ctx.fill();
+    }
+  }
+
+  // アイテムボックスクラス
+  class ItemBox {
+    constructor(x, y, type) {
+      this.x = x;
+      this.y = y;
+      this.type = type; // banana or shell
+      this.size = 18;
+    }
+    draw() {
+      ctx.fillStyle = this.type === "banana" ? "gold" : "aqua";
+      ctx.beginPath();
+      ctx.arc(this.x, this.y, this.size, 0, 2 * Math.PI);
+      ctx.fill();
+    }
+  }
+
+  // UI描画
+  function drawUI() {
+    let rankSorted = [...cars].sort((a, b) => {
+      if (a.lap !== b.lap) return b.lap - a.lap;
+      return a.time - b.time;
+    });
+
+    let uiText = rankSorted.map((c, i) =>
+      `${i + 1}位: ${c.name} (LAP: ${c.lap}${c.done ? " ✔" : ""})`
+    ).join("<br>");
+
+    if (cars[0].item) {
+      uiText += `<br>🎁 所持アイテム: ${cars[0].item}`;
+    }
+
+    ui.innerHTML = uiText;
+  }
+
+  // 演出・BGM制御
+  let gameState = "countdown"; // countdown, racing, result
+  let countdown = 3;
+  let countdownTimer = 0;
+
+  function playBGM() {
+    if (sounds.bgm.paused) {
+      sounds.bgm.play();
+    }
+  }
+  function stopBGM() {
+    if (!sounds.bgm.paused) {
+      sounds.bgm.pause();
+      sounds.bgm.currentTime = 0;
+    }
+  }
+
+  ctx.font = "48px sans-serif";
+  ctx.textAlign = "center";
+  ctx.fillStyle = "yellow";
+
+  function drawCountdown() {
+    ctx.clearRect(0, 0, W, H);
+    if (countdown > 0) {
+      ctx.fillText(countdown, W / 2, H / 2);
+    } else {
+      ctx.fillText("GO!", W / 2, H / 2);
+    }
+  }
+
+  function drawResults() {
+    ctx.clearRect(0, 0, W, H);
+    ctx.fillStyle = "white";
+    ctx.font = "36px sans-serif";
+    ctx.fillText("レース終了！", W / 2, 80);
+    ctx.font = "28px monospace";
+    let rankSorted = [...cars].sort((a, b) => {
+      if (a.lap !== b.lap) return b.lap - a.lap;
+      return a.time - b.time;
+    });
+    for (let i = 0; i < rankSorted.length; i++) {
+      let c = rankSorted[i];
+      ctx.fillText(
+        `${i + 1}位: ${c.name} - LAP:${c.lap} - TIME:${c.time.toFixed(2)}s`,
+        W / 2,
+        140 + i * 40
+      );
+    }
+  }
+
+  function updateCountdown(dt) {
+    countdownTimer += dt;
+    if (countdownTimer >= 1) {
+      countdownTimer = 0;
+      countdown--;
+      if (countdown >= 0) {
+        sounds.start.currentTime = 0;
+        sounds.start.play();
+      }
+      if (countdown < 0) {
+        gameState = "racing";
+        playBGM();
+      }
+    }
+  }
+
+  function getPlayerInput() {
+    return {
+      up: keys["ArrowUp"] || false,
+      down: keys["ArrowDown"] || false,
+      left: keys["ArrowLeft"] || false,
+      right: keys["ArrowRight"] || false,
+      item: keys[" "] || false
+    };
+  }
+
+  // ゲーム初期化
+  let cars = [];
+  let shells = [];
+  let bananas = [];
+  let items = [];
+
+  function init() {
+    cars = [
+      new Car("Player", 120, 320, "red", false),
+      new Car("CPU1", 140, 360, "blue", true),
+      new Car("CPU2", 120, 280, "green", true),
+      new Car("CPU3", 100, 320, "yellow", true)
+    ];
+
+    shells = [];
+    bananas = [];
+    items = [
+      new ItemBox(400, 150, "banana"),
+      new ItemBox(700, 300, "shell"),
+      new ItemBox(400, 450, "banana"),
+      new ItemBox(100, 300, "shell")
+    ];
+
+    gameState = "countdown";
+    countdown = 3;
+    countdownTimer = 0;
+
+    prepareMask();
+  }
+
+  let lastTime = 0;
+  function loop(t=0) {
+    const dt = (t - lastTime) / 1000;
+    lastTime = t;
+
+    if (gameState === "countdown") {
+      updateCountdown(dt);
+      drawCountdown();
+    } else if (gameState === "racing") {
+      ctx.clearRect(0, 0, W, H);
+      ctx.drawImage(track, 0, 0);
+
+      const input = getPlayerInput();
+
+      cars.forEach(car => {
+        if (car.isCPU) {
+          car.update(dt);
+        } else {
+          car.update(dt, input);
+        }
+        car.draw();
+      });
+
+      // アイテム取得判定
+      cars.forEach(car => {
+        items.forEach((item, i) => {
+          if (!car.item && Math.hypot(car.x - item.x, car.y - item.y) < car.size) {
+            car.item = item.type;
+            items.splice(i, 1);
+            sounds.item.currentTime = 0;
+            sounds.item.play();
+          }
+        });
+      });
+
+      // シェル更新・描画
+      shells.forEach((shell, i) => {
+        shell.update();
+        shell.draw();
+        if (shell.dead) shells.splice(i, 1);
+      });
+
+      drawUI();
+
+      // アイテム使用
+      if (input.item) {
+        cars[0].useItem();
+        keys[" "] = false;
+      }
+
+      // ゴール判定
+      if (cars.every(c => c.done)) {
+        stopBGM();
+        gameState = "result";
+      }
+    } else if (gameState === "result") {
+      drawResults();
+    }
+
+    requestAnimationFrame(loop);
+  }
+
+  window.onload = () => {
+    init();
+    loop();
+  };
+</script>
+</body>
+</html>
